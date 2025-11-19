@@ -1,4 +1,4 @@
-# deta_dash.py (date parsing fix)
+# deta_dash.py (fixed: support C-style block comments so parentheses params aren't broken by '/* ... */')
 import re
 import io
 import sys
@@ -28,13 +28,14 @@ class DetaDashParseError(DetaDashError):
 # -------------------------
 # Tokenizer
 # -------------------------
-# Regex for tokens excluding triple-quoted strings (they are handled manually)
-# DATE must come before NUMBER so full ISO datetimes are captured (not split into NUMBER + others)
+# DATE must come before NUMBER so ISO datetimes are captured
+# Add COMMENT3 to support C-style block comments (/* ... */) so they don't break parsing
 TOKEN_REGEX = re.compile(
     r'''
     (?P<WHITESPACE>\s+)
   | (?P<COMMENT>//[^\n]*)
   | (?P<COMMENT2>\#[^\n]*)
+  | (?P<COMMENT3>/\*.*?\*/)
   | (?P<DQ>"(?:\\.|[^"\\])*")
   | (?P<SQ>'(?:\\.|[^'\\])*')
   | (?P<LBRACE>\{)
@@ -52,6 +53,7 @@ TOKEN_REGEX = re.compile(
   | (?P<RPAREN>\))
   | (?P<DOT>\.)
   | (?P<PLUS>\+)
+  | (?P<MINUS>-)
   | (?P<SLASH>/)
   | (?P<PERCENT>%)
   | (?P<CARET>\^)
@@ -82,16 +84,14 @@ def tokenize(text: str):
             quote = '"""' if text.startswith('"""', pos) else "'''"
             start_line = line
             start_col = col
-            # find closing
             end_idx = text.find(quote, pos + 3)
             if end_idx == -1:
                 raise DetaDashParseError("Unterminated triple-quoted string", line, col)
             content = text[pos+3:end_idx]
-            # update line/col
             newlines = content.count("\n")
             if newlines:
                 line += newlines
-                col = 1 + len(content.rsplit("\n", 1)[-1]) + 3  # position after the closing quotes on last line
+                col = 1 + len(content.rsplit("\n", 1)[-1]) + 3
             else:
                 col += len(content) + 3
             pos = end_idx + 3
@@ -104,7 +104,6 @@ def tokenize(text: str):
             raise DetaDashParseError(f"Unexpected token: {snippet!r}", line, col)
         kind = m.lastgroup
         raw = m.group(kind)
-        start = pos
         pos = m.end()
         newlines = raw.count("\n")
         if kind == "WHITESPACE" or kind.startswith("COMMENT"):
@@ -117,7 +116,6 @@ def tokenize(text: str):
         token_value = raw
         if kind in ("DQ", "SQ"):
             inner = token_value[1:-1]
-            # unescape common escapes
             try:
                 inner = bytes(inner, "utf-8").decode("unicode_escape")
             except Exception:
@@ -134,19 +132,16 @@ def tokenize(text: str):
 # -------------------------
 # Safe expression evaluator (AST)
 # -------------------------
-# --- safe_eval_expr (patched) ---
 def safe_eval_expr(expr_src: str, context: dict):
     try:
         node = ast.parse(expr_src, mode="eval")
     except SyntaxError as e:
         raise DetaDashError(f"Invalid expression: {expr_src!r}: {e}")
 
-    # Disallowed constructs
     for n in ast.walk(node):
         if isinstance(n, (ast.Call, ast.Import, ast.ImportFrom, ast.Lambda, ast.DictComp, ast.ListComp, ast.GeneratorExp, ast.Yield, ast.YieldFrom)):
             raise DetaDashError("Disallowed expression construct")
 
-    # evaluator
     ops = {
         ast.Add: operator.add,
         ast.Sub: operator.sub,
@@ -161,7 +156,6 @@ def safe_eval_expr(expr_src: str, context: dict):
         ast.USub: operator.neg,
     }
 
-    # Compatibility helpers — some AST node classes were removed in newer Python versions
     NumType = getattr(ast, "Num", None)
     IndexType = getattr(ast, "Index", None)
 
@@ -170,7 +164,6 @@ def safe_eval_expr(expr_src: str, context: dict):
             return eval_node(n.body)
         if isinstance(n, ast.Constant):
             return n.value
-        # older ASTs used ast.Num for numeric constants
         if NumType is not None and isinstance(n, NumType):
             return n.n
         if isinstance(n, ast.BinOp):
@@ -199,12 +192,10 @@ def safe_eval_expr(expr_src: str, context: dict):
         if isinstance(n, ast.Attribute):
             val = eval_node(n.value)
             attr = n.attr
-            # support dict attribute-like access
             if isinstance(val, dict):
                 if attr not in val:
                     raise DetaDashError(f"Unknown attribute {attr!r} on object")
                 return val[attr]
-            # fallback to getattr for objects
             try:
                 return getattr(val, attr)
             except Exception:
@@ -212,15 +203,12 @@ def safe_eval_expr(expr_src: str, context: dict):
         if isinstance(n, ast.Subscript):
             val = eval_node(n.value)
             sl = n.slice
-            # older AST used ast.Index
             if IndexType is not None and isinstance(sl, IndexType):
                 idx = eval_node(sl.value)
             else:
-                # In newer versions the slice can be a direct node (Constant, Name, etc.)
                 try:
                     idx = eval_node(sl)
                 except DetaDashError:
-                    # If slice is a Slice node or something unsupported, raise a clear error
                     raise DetaDashError("Unsupported subscript slice type")
             try:
                 return val[idx]
@@ -230,18 +218,14 @@ def safe_eval_expr(expr_src: str, context: dict):
             return tuple(eval_node(elt) for elt in n.elts)
         if isinstance(n, ast.List):
             return [eval_node(elt) for elt in n.elts]
-        # disallow everything else explicitly
         raise DetaDashError(f"Unsupported expression node: {type(n).__name__}")
 
     try:
         result = eval_node(node)
-        # numeric coercion: allow int/float
         if isinstance(result, (int, float)):
             return result
-        # booleans are acceptable
         if isinstance(result, bool):
             return result
-        # allow numeric-like strings to be converted
         try:
             return float(result)
         except Exception:
@@ -250,6 +234,7 @@ def safe_eval_expr(expr_src: str, context: dict):
         raise
     except Exception as e:
         raise DetaDashError(f"Error evaluating expression {expr_src!r}: {e}")
+
 # -------------------------
 # Parser (recursive descent)
 # -------------------------
@@ -303,7 +288,6 @@ class Parser:
             obj[key] = value
             self.root_context[key] = value
             if self.accept("COMMA"):
-                # allow trailing comma
                 continue
             elif self.peek().type == "RBRACE":
                 self.next()
@@ -352,16 +336,23 @@ class Parser:
                 raise DetaDashParseError(f"Unknown anchor reference: {name}", name_token.line, name_token.col)
             return copy.deepcopy(self.anchors[name])
         if t.type == "EQUALS":
-            # expression until comma, closing brace/bracket or EOF
-            eq_tok = self.next()
+            # collect expression tokens, but keep track of bracket/paren depth so
+            # subscripts and grouped expressions are fully included
+            self.next()  # consume '='
             expr_parts = []
+            depth = 0
             while True:
                 nt = self.peek()
-                if nt.type in ("COMMA", "RBRACE", "RBRACK", "EOF"):
+                # break only on comma/closing-brace/EOF when not inside parens/brackets
+                if nt.type in ("COMMA", "RBRACE", "EOF") and depth == 0:
                     break
-                # convert token sequence into a source string usable by AST evaluator
                 tok = self.next()
                 expr_parts.append(tok.value)
+                if tok.type in ("LPAREN", "LBRACK"):
+                    depth += 1
+                elif tok.type in ("RPAREN", "RBRACK"):
+                    if depth > 0:
+                        depth -= 1
             expr_src = " ".join(str(x) for x in expr_parts).strip()
             try:
                 val = safe_eval_expr(expr_src, self.root_context)
@@ -373,15 +364,27 @@ class Parser:
             next_token = self.next()
             if next_token.type == "IDENT":
                 ident = next_token.value
-                # support @ident("param") and @ident "param" forms
                 if self.peek().type == "LPAREN":
-                    self.next()
-                    param_token = self.next()
-                    if param_token.type not in ("STRING", "NUMBER", "DATE"):
-                        raise DetaDashParseError("Expected string/number/date parameter inside parentheses for @tag", param_token.line, param_token.col)
-                    # consume closing paren
-                    self.expect("RPAREN")
-                    param = param_token.value
+                    # collect everything up to the matching RPAREN (allowing comments to be skipped)
+                    self.next()  # consume LPAREN
+                    param_parts = []
+                    depth = 1
+                    while True:
+                        nt = self.peek()
+                        if nt.type == "EOF":
+                            raise DetaDashParseError("Unterminated parentheses in @ tag", nt.line, nt.col)
+                        tok = self.next()
+                        if tok.type == "LPAREN":
+                            depth += 1
+                        elif tok.type == "RPAREN":
+                            depth -= 1
+                            if depth == 0:
+                                break
+                        param_parts.append(tok.value)
+                    param = "".join(str(x) for x in param_parts).strip()
+                    # strip surrounding quotes if the whole param was a quoted string
+                    if len(param) >= 2 and ((param[0] == '"' and param[-1] == '"') or (param[0] == "'" and param[-1] == "'")):
+                        param = param[1:-1]
                     return self.handle_at_tag(ident, param)
                 elif self.peek().type == "STRING":
                     param = self.next().value
@@ -400,14 +403,26 @@ class Parser:
             next_token = self.peek()
             if next_token.type == "IDENT":
                 ident = self.next().value
-                # support !tag("param") or !tag "param"
                 if self.peek().type == "LPAREN":
-                    self.next()
-                    param_tok = self.next()
-                    if param_tok.type not in ("STRING", "NUMBER"):
-                        raise DetaDashParseError("Expected string/number parameter inside parentheses for !tag", param_tok.line, param_tok.col)
-                    self.expect("RPAREN")
-                    param = param_tok.value
+                    # collect everything up to the matching RPAREN for !tag(...)
+                    self.next()  # consume LPAREN
+                    param_parts = []
+                    depth = 1
+                    while True:
+                        nt = self.peek()
+                        if nt.type == "EOF":
+                            raise DetaDashParseError("Unterminated parentheses in ! tag", nt.line, nt.col)
+                        tok = self.next()
+                        if tok.type == "LPAREN":
+                            depth += 1
+                        elif tok.type == "RPAREN":
+                            depth -= 1
+                            if depth == 0:
+                                break
+                        param_parts.append(tok.value)
+                    param = "".join(str(x) for x in param_parts).strip()
+                    if len(param) >= 2 and ((param[0] == '"' and param[-1] == '"') or (param[0] == "'" and param[-1] == "'")):
+                        param = param[1:-1]
                     return self.handle_bang_tag(ident, param)
                 if self.peek().type == "STRING":
                     param = self.next().value
@@ -443,7 +458,6 @@ class Parser:
                     return float("-inf")
                 raise DetaDashParseError(f"Invalid number literal: {s}", t.line, t.col)
         if t.type == "DATE":
-            # treat bare date token as ISO datetime
             self.next()
             return self.handle_at_date_literal(t.value)
         if t.type == "IDENT":
@@ -470,9 +484,7 @@ class Parser:
 
     def handle_at_date_literal(self, raw):
         try:
-            # Robust handling for ISO datetimes including 'Z'
             if isinstance(raw, str) and raw.endswith("Z"):
-                # fromisoformat doesn't accept 'Z'; convert to +00:00
                 iso = raw[:-1] + "+00:00"
                 return datetime.fromisoformat(iso)
             return datetime.fromisoformat(raw)
@@ -482,7 +494,6 @@ class Parser:
     def handle_bang_tag(self, ident, param):
         if ident.lower() == "base64":
             try:
-                # param might include quotes if it was read as a raw token; ensure it's bytes input to b64decode
                 if isinstance(param, str):
                     return base64.b64decode(param)
                 return base64.b64decode(str(param))
@@ -551,33 +562,22 @@ def dump(obj: Any, fp):
 if __name__ == "__main__":
     example = r'''
 {
-    // simple comment
-    name: "DetaDash",
-    version: "1.0",
-    debug: true,
-    window: {
-        width: 800,
-        height: 600,
-    },
-    colors: [
-        "red",
-        "green",
-        "blue",
+  defaults: &defaults { window: { width: 1280, height: 720 } },
+  store_cfg: &store {
+    inventory: [
+      { id: "sword", price: 150, qty: 3 },
+      { id: "shield", price: 100, qty: 2 },
+      { id: "potion", price: 25, qty: 10 },
     ],
-    created: @2025-11-19T10:22:00Z,
-    description: """
-This is a
-multi-line description.
-""",
-    shared: &cfg {
-        lives: 3,
-        ammo: 90,
-    },
-    clone: *cfg,
-    area: = window.width * window.height,
+  },
+  total_inventory_value: = store_cfg.inventory[0].price * store_cfg.inventory[0].qty
+                         + store_cfg.inventory[1].price * store_cfg.inventory[1].qty
+                         + store_cfg.inventory[2].price * store_cfg.inventory[2].qty,
+  adjusted_area: = (defaults.window.width - 200) * (defaults.window.height - 100),
+  logo_png: !base64("iVBORw0KGgoAAAANSUhEUgAAAAUA" /* truncated example data */),
 }
 '''
-    print("Parsing example DetaDash...")
+    print("Parsing example with subscripts, parentheses and block comments in tags...")
     try:
         data = loads(example)
         from pprint import pprint
