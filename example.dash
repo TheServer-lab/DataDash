@@ -1,0 +1,111 @@
+{
+  // Data Dash: full-feature demo
+  // Shows comments, strings, triple-quoted strings, anchors & references,
+  // expressions, @-literals (dates, uuid), !-tags (base64 and generic),
+  // number formats (decimal, hex, binary, float, scientific), arrays, objects,
+  // attribute access, subscripts, and trailing commas.
+
+  app: "DataDash Full Feature Demo",
+  version: "1.0.0",
+
+  // ISO datetime with @ (timezone-aware UTC)
+  created_at: @2025-11-19T19:18:16Z,
+
+  // Bare ISO datetime (DATE token is supported without @ as well)
+  imported_at: 2025-11-19T14:00:00-05:00,
+
+  // UUID literal
+  instance_id: @uuid("12345678-1234-5678-1234-567812345678"),
+
+  // Multi-line description (triple-quoted)
+  description: """
+This file demonstrates nearly every feature supported by the parser:
+- // and # comments
+- single- and double-quoted strings
+- triple-quoted multi-line strings
+- anchors (&name) and references (*name)
+- expressions starting with =
+- @-literals for dates and uuid
+- !-tags for base64 (returns bytes) and custom tags (returns object)
+- numeric formats: decimal, hex, binary, floats, scientific notation
+- nested objects, arrays, attribute access and subscripts in expressions
+""",
+
+  # top-level defaults defined as an anchor
+  defaults: &defaults {
+    name: "ExampleApp",
+    theme: "cyber-dark",
+    max_players: 4,
+    window: { width: 1280, height: 720 },
+    physics: {
+      gravity: 9.81,
+      friction: 0.2,
+    },
+    // nested discounts (used by expressions)
+    discounts: {
+      seasonal: 0.15,
+      vip: 0.25,
+    },
+  },
+
+  // Clone defaults by reference; later we override a field in place
+  staging: *defaults,
+
+  // A separate anchored config that will be reused
+  store_cfg: &store {
+    currency: "GOLD",
+    tax_rate: 0.07,
+    inventory: [
+      { id: "sword",   price: 150, qty: 3 },
+      { id: "shield",  price: 100, qty: 2 },
+      { id: "potion",  price: 25,  qty: 10 },
+    ],
+  },
+
+  // Use a reference to the anchored store config
+  shop: *store,
+
+  // Total inventory value computed with an expression (attribute access + subscripts)
+  // Note: expressions see top-level names; `store_cfg` is in root context because it was set when parsed.
+  total_inventory_value: = store_cfg.inventory[0].price * store_cfg.inventory[0].qty
+                         + store_cfg.inventory[1].price * store_cfg.inventory[1].qty
+                         + store_cfg.inventory[2].price * store_cfg.inventory[2].qty,
+
+  // Computed area and derived values (demonstrates arithmetic and attribute access)
+  screen_area: = defaults.window.width * defaults.window.height,
+  adjusted_area: = (defaults.window.width - 200) * (defaults.window.height - 100),
+  inv_area: = 1 / screen_area,
+  negative_gravity: = -defaults.physics.gravity,
+
+  // Numeric variety
+  int_decimal: 42,
+  int_hex: 0xFF,
+  int_bin: 0b101010,
+  float_val: 3.14159,
+  sci_notation: 1.23e4,
+
+  // Base64 examples: parser returns bytes for !base64(...)
+  logo_png: !base64("iVBORw0KGgoAAAANSUhEUgAAAAUA" /* truncated example data */),
+  small_blob: !base64 "SGVsbG8sIERhdGFEYXNoIQ==", // "Hello, DataDash!"
+
+  // Generic !-tag that is not special-cased returns an object
+  custom_tag: !meta "example-metadata",
+
+  // Demonstrate strings with embedded quotes and escape sequences
+  welcome: "Welcome to \"DataDash\" — enjoy parsing!",
+  note_single: 'single quoted string works too',
+
+  // Arrays, booleans, and null
+  colors: ["red", "green", "blue",],
+  flags: [true, false, null,],
+
+  // Trailing commas everywhere are allowed
+  final_notes: """
+You can parse this file with deta_dash.loads(...) and inspect:
+- bytes from !base64 (logo_png, small_blob)
+- datetime and uuid objects from @ and bare DATE tokens (created_at, imported_at, instance_id)
+- computed numeric values from expressions (screen_area, total_inventory_value)
+- anchors and references (defaults, store_cfg, shop)
+""",
+}
+
