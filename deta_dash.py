@@ -1,4 +1,4 @@
-# deta_dash.py (fixed)
+# deta_dash.py (date parsing fix)
 import re
 import io
 import sys
@@ -29,7 +29,7 @@ class DetaDashParseError(DetaDashError):
 # Tokenizer
 # -------------------------
 # Regex for tokens excluding triple-quoted strings (they are handled manually)
-# Add DATE token for ISO datetimes, operators and punctuation used in expressions
+# DATE must come before NUMBER so full ISO datetimes are captured (not split into NUMBER + others)
 TOKEN_REGEX = re.compile(
     r'''
     (?P<WHITESPACE>\s+)
@@ -37,7 +37,6 @@ TOKEN_REGEX = re.compile(
   | (?P<COMMENT2>\#[^\n]*)
   | (?P<DQ>"(?:\\.|[^"\\])*")
   | (?P<SQ>'(?:\\.|[^'\\])*')
-  | (?P<TRIOPEN>"""{1,3}|'{3})
   | (?P<LBRACE>\{)
   | (?P<RBRACE>\})
   | (?P<LBRACK>\[)
@@ -56,8 +55,8 @@ TOKEN_REGEX = re.compile(
   | (?P<SLASH>/)
   | (?P<PERCENT>%)
   | (?P<CARET>\^)
-  | (?P<NUMBER>-?(?:0[xX][0-9a-fA-F]+|0[bB][01]+|\d+(\.\d+)?([eE][+-]?\d+)?))
   | (?P<DATE>\d{4}-\d{2}-\d{2}T[0-9:\.\+\-Zz]+)
+  | (?P<NUMBER>-?(?:0[xX][0-9a-fA-F]+|0[bB][01]+|\d+(\.\d+)?([eE][+-]?\d+)?))
   | (?P<IDENT>[A-Za-z_][A-Za-z0-9_\-]*)
   ''',
     re.VERBOSE | re.DOTALL,
@@ -125,7 +124,6 @@ def tokenize(text: str):
                 pass
             token_value = inner
             kind = "STRING"
-        # DATE tokens keep raw string (ISO format)
         yield Token(kind, token_value, line, col)
         if newlines:
             line += newlines
@@ -136,6 +134,7 @@ def tokenize(text: str):
 # -------------------------
 # Safe expression evaluator (AST)
 # -------------------------
+# --- safe_eval_expr (patched) ---
 def safe_eval_expr(expr_src: str, context: dict):
     try:
         node = ast.parse(expr_src, mode="eval")
@@ -162,12 +161,17 @@ def safe_eval_expr(expr_src: str, context: dict):
         ast.USub: operator.neg,
     }
 
+    # Compatibility helpers — some AST node classes were removed in newer Python versions
+    NumType = getattr(ast, "Num", None)
+    IndexType = getattr(ast, "Index", None)
+
     def eval_node(n):
         if isinstance(n, ast.Expression):
             return eval_node(n.body)
         if isinstance(n, ast.Constant):
             return n.value
-        if isinstance(n, ast.Num):  # for older ast
+        # older ASTs used ast.Num for numeric constants
+        if NumType is not None and isinstance(n, NumType):
             return n.n
         if isinstance(n, ast.BinOp):
             left = eval_node(n.left)
@@ -207,12 +211,17 @@ def safe_eval_expr(expr_src: str, context: dict):
                 raise DetaDashError(f"Cannot access attribute {attr!r}")
         if isinstance(n, ast.Subscript):
             val = eval_node(n.value)
-            # slice node types changed between versions
             sl = n.slice
-            if isinstance(sl, ast.Index):
+            # older AST used ast.Index
+            if IndexType is not None and isinstance(sl, IndexType):
                 idx = eval_node(sl.value)
             else:
-                idx = eval_node(sl)
+                # In newer versions the slice can be a direct node (Constant, Name, etc.)
+                try:
+                    idx = eval_node(sl)
+                except DetaDashError:
+                    # If slice is a Slice node or something unsupported, raise a clear error
+                    raise DetaDashError("Unsupported subscript slice type")
             try:
                 return val[idx]
             except Exception as e:
@@ -241,7 +250,6 @@ def safe_eval_expr(expr_src: str, context: dict):
         raise
     except Exception as e:
         raise DetaDashError(f"Error evaluating expression {expr_src!r}: {e}")
-
 # -------------------------
 # Parser (recursive descent)
 # -------------------------
@@ -462,9 +470,11 @@ class Parser:
 
     def handle_at_date_literal(self, raw):
         try:
-            # Accept both '2025-...Z' and timezone offsets
+            # Robust handling for ISO datetimes including 'Z'
             if isinstance(raw, str) and raw.endswith("Z"):
-                return datetime.fromisoformat(raw[:-1]).replace(tzinfo=timezone.utc)
+                # fromisoformat doesn't accept 'Z'; convert to +00:00
+                iso = raw[:-1] + "+00:00"
+                return datetime.fromisoformat(iso)
             return datetime.fromisoformat(raw)
         except Exception:
             raise DetaDashParseError(f"Invalid date literal: {raw}")
