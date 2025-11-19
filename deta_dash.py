@@ -8,6 +8,7 @@ import base64
 import uuid
 from datetime import datetime, timezone
 from typing import Any, Tuple
+import operator
 
 __all__ = ["loads", "dumps", "load", "dump", "DetaDashError"]
 
@@ -28,6 +29,7 @@ class DetaDashParseError(DetaDashError):
 # Tokenizer
 # -------------------------
 # Regex for tokens excluding triple-quoted strings (they are handled manually)
+# Add DATE token for ISO datetimes, operators and punctuation used in expressions
 TOKEN_REGEX = re.compile(
     r'''
     (?P<WHITESPACE>\s+)
@@ -35,6 +37,7 @@ TOKEN_REGEX = re.compile(
   | (?P<COMMENT2>\#[^\n]*)
   | (?P<DQ>"(?:\\.|[^"\\])*")
   | (?P<SQ>'(?:\\.|[^'\\])*')
+  | (?P<TRIOPEN>"""{1,3}|'{3})
   | (?P<LBRACE>\{)
   | (?P<RBRACE>\})
   | (?P<LBRACK>\[)
@@ -46,7 +49,15 @@ TOKEN_REGEX = re.compile(
   | (?P<EQUALS>=)
   | (?P<ASTERISK>\*)
   | (?P<AMP>&)
+  | (?P<LPAREN>\()
+  | (?P<RPAREN>\))
+  | (?P<DOT>\.)
+  | (?P<PLUS>\+)
+  | (?P<SLASH>/)
+  | (?P<PERCENT>%)
+  | (?P<CARET>\^)
   | (?P<NUMBER>-?(?:0[xX][0-9a-fA-F]+|0[bB][01]+|\d+(\.\d+)?([eE][+-]?\d+)?))
+  | (?P<DATE>\d{4}-\d{2}-\d{2}T[0-9:\.\+\-Zz]+)
   | (?P<IDENT>[A-Za-z_][A-Za-z0-9_\-]*)
   ''',
     re.VERBOSE | re.DOTALL,
@@ -81,7 +92,7 @@ def tokenize(text: str):
             newlines = content.count("\n")
             if newlines:
                 line += newlines
-                col = 1 + len(content.rsplit("\n", 1)[-1]) + 3
+                col = 1 + len(content.rsplit("\n", 1)[-1]) + 3  # position after the closing quotes on last line
             else:
                 col += len(content) + 3
             pos = end_idx + 3
@@ -114,6 +125,7 @@ def tokenize(text: str):
                 pass
             token_value = inner
             kind = "STRING"
+        # DATE tokens keep raw string (ISO format)
         yield Token(kind, token_value, line, col)
         if newlines:
             line += newlines
@@ -129,29 +141,102 @@ def safe_eval_expr(expr_src: str, context: dict):
         node = ast.parse(expr_src, mode="eval")
     except SyntaxError as e:
         raise DetaDashError(f"Invalid expression: {expr_src!r}: {e}")
+
+    # Disallowed constructs
     for n in ast.walk(node):
-        if isinstance(n, ast.Call):
-            raise DetaDashError("Function calls not allowed in expressions")
-        if isinstance(n, (ast.Attribute, ast.Import, ast.ImportFrom, ast.Lambda, ast.DictComp, ast.ListComp, ast.GeneratorExp)):
+        if isinstance(n, (ast.Call, ast.Import, ast.ImportFrom, ast.Lambda, ast.DictComp, ast.ListComp, ast.GeneratorExp, ast.Yield, ast.YieldFrom)):
             raise DetaDashError("Disallowed expression construct")
-    class NameReplacer(ast.NodeTransformer):
-        def visit_Name(self, n):
+
+    # evaluator
+    ops = {
+        ast.Add: operator.add,
+        ast.Sub: operator.sub,
+        ast.Mult: operator.mul,
+        ast.Div: operator.truediv,
+        ast.Mod: operator.mod,
+        ast.Pow: operator.pow,
+        ast.FloorDiv: operator.floordiv,
+    }
+    un_ops = {
+        ast.UAdd: lambda x: x,
+        ast.USub: operator.neg,
+    }
+
+    def eval_node(n):
+        if isinstance(n, ast.Expression):
+            return eval_node(n.body)
+        if isinstance(n, ast.Constant):
+            return n.value
+        if isinstance(n, ast.Num):  # for older ast
+            return n.n
+        if isinstance(n, ast.BinOp):
+            left = eval_node(n.left)
+            right = eval_node(n.right)
+            op_type = type(n.op)
+            if op_type in ops:
+                try:
+                    return ops[op_type](left, right)
+                except Exception as e:
+                    raise DetaDashError(f"Error in binary operation: {e}")
+            raise DetaDashError(f"Unsupported binary operator: {op_type}")
+        if isinstance(n, ast.UnaryOp):
+            operand = eval_node(n.operand)
+            op_type = type(n.op)
+            if op_type in un_ops:
+                try:
+                    return un_ops[op_type](operand)
+                except Exception as e:
+                    raise DetaDashError(f"Error in unary operation: {e}")
+            raise DetaDashError(f"Unsupported unary operator: {op_type}")
+        if isinstance(n, ast.Name):
             if n.id not in context:
                 raise DetaDashError(f"Unknown name in expression: {n.id!r}")
-            v = context[n.id]
-            if isinstance(v, (int, float)):
-                return ast.copy_location(ast.Constant(value=v), n)
+            return context[n.id]
+        if isinstance(n, ast.Attribute):
+            val = eval_node(n.value)
+            attr = n.attr
+            # support dict attribute-like access
+            if isinstance(val, dict):
+                if attr not in val:
+                    raise DetaDashError(f"Unknown attribute {attr!r} on object")
+                return val[attr]
+            # fallback to getattr for objects
+            try:
+                return getattr(val, attr)
+            except Exception:
+                raise DetaDashError(f"Cannot access attribute {attr!r}")
+        if isinstance(n, ast.Subscript):
+            val = eval_node(n.value)
+            # slice node types changed between versions
+            sl = n.slice
+            if isinstance(sl, ast.Index):
+                idx = eval_node(sl.value)
             else:
-                try:
-                    fv = float(v)
-                    return ast.copy_location(ast.Constant(value=fv), n)
-                except Exception:
-                    raise DetaDashError(f"Name {n.id!r} does not resolve to a number")
+                idx = eval_node(sl)
+            try:
+                return val[idx]
+            except Exception as e:
+                raise DetaDashError(f"Subscript error: {e}")
+        if isinstance(n, ast.Tuple):
+            return tuple(eval_node(elt) for elt in n.elts)
+        if isinstance(n, ast.List):
+            return [eval_node(elt) for elt in n.elts]
+        # disallow everything else explicitly
+        raise DetaDashError(f"Unsupported expression node: {type(n).__name__}")
+
     try:
-        new_node = NameReplacer().visit(node)
-        ast.fix_missing_locations(new_node)
-        compiled = compile(new_node, "<deta_expr>", "eval")
-        return eval(compiled, {"__builtins__": {}}, {})
+        result = eval_node(node)
+        # numeric coercion: allow int/float
+        if isinstance(result, (int, float)):
+            return result
+        # booleans are acceptable
+        if isinstance(result, bool):
+            return result
+        # allow numeric-like strings to be converted
+        try:
+            return float(result)
+        except Exception:
+            raise DetaDashError(f"Expression did not evaluate to a number: {expr_src!r}")
     except DetaDashError:
         raise
     except Exception as e:
@@ -202,7 +287,7 @@ class Parser:
             if self.accept("RBRACE"):
                 break
             key_token = self.next()
-            if key_token.type not in ("IDENT", "STRING"):
+            if key_token.type not in ("IDENT", "STRING", "TRI_STRING"):
                 raise DetaDashParseError("Expected key (identifier or string) in object", key_token.line, key_token.col)
             key = key_token.value
             self.expect("COLON")
@@ -210,10 +295,8 @@ class Parser:
             obj[key] = value
             self.root_context[key] = value
             if self.accept("COMMA"):
-                if self.peek().type == "RBRACE":
-                    continue
-                else:
-                    continue
+                # allow trailing comma
+                continue
             elif self.peek().type == "RBRACE":
                 self.next()
                 break
@@ -231,10 +314,7 @@ class Parser:
             value = self.parse_value()
             arr.append(value)
             if self.accept("COMMA"):
-                if self.peek().type == "RBRACK":
-                    continue
-                else:
-                    continue
+                continue
             elif self.peek().type == "RBRACK":
                 self.next()
                 break
@@ -264,13 +344,16 @@ class Parser:
                 raise DetaDashParseError(f"Unknown anchor reference: {name}", name_token.line, name_token.col)
             return copy.deepcopy(self.anchors[name])
         if t.type == "EQUALS":
-            self.next()
+            # expression until comma, closing brace/bracket or EOF
+            eq_tok = self.next()
             expr_parts = []
             while True:
                 nt = self.peek()
                 if nt.type in ("COMMA", "RBRACE", "RBRACK", "EOF"):
                     break
-                expr_parts.append(self.next().value)
+                # convert token sequence into a source string usable by AST evaluator
+                tok = self.next()
+                expr_parts.append(tok.value)
             expr_src = " ".join(str(x) for x in expr_parts).strip()
             try:
                 val = safe_eval_expr(expr_src, self.root_context)
@@ -282,14 +365,24 @@ class Parser:
             next_token = self.next()
             if next_token.type == "IDENT":
                 ident = next_token.value
-                if self.peek().type == "STRING":
+                # support @ident("param") and @ident "param" forms
+                if self.peek().type == "LPAREN":
+                    self.next()
+                    param_token = self.next()
+                    if param_token.type not in ("STRING", "NUMBER", "DATE"):
+                        raise DetaDashParseError("Expected string/number/date parameter inside parentheses for @tag", param_token.line, param_token.col)
+                    # consume closing paren
+                    self.expect("RPAREN")
+                    param = param_token.value
+                    return self.handle_at_tag(ident, param)
+                elif self.peek().type == "STRING":
                     param = self.next().value
                     return self.handle_at_tag(ident, param)
                 else:
                     raise DetaDashParseError("Unsupported @ literal form", next_token.line, next_token.col)
-            elif next_token.type == "STRING":
+            elif next_token.type in ("STRING", "TRI_STRING"):
                 return next_token.value
-            elif next_token.type == "NUMBER":
+            elif next_token.type in ("DATE", "NUMBER"):
                 raw = next_token.value
                 return self.handle_at_date_literal(raw)
             else:
@@ -299,6 +392,15 @@ class Parser:
             next_token = self.peek()
             if next_token.type == "IDENT":
                 ident = self.next().value
+                # support !tag("param") or !tag "param"
+                if self.peek().type == "LPAREN":
+                    self.next()
+                    param_tok = self.next()
+                    if param_tok.type not in ("STRING", "NUMBER"):
+                        raise DetaDashParseError("Expected string/number parameter inside parentheses for !tag", param_tok.line, param_tok.col)
+                    self.expect("RPAREN")
+                    param = param_tok.value
+                    return self.handle_bang_tag(ident, param)
                 if self.peek().type == "STRING":
                     param = self.next().value
                     return self.handle_bang_tag(ident, param)
@@ -332,6 +434,10 @@ class Parser:
                         return float("inf")
                     return float("-inf")
                 raise DetaDashParseError(f"Invalid number literal: {s}", t.line, t.col)
+        if t.type == "DATE":
+            # treat bare date token as ISO datetime
+            self.next()
+            return self.handle_at_date_literal(t.value)
         if t.type == "IDENT":
             self.next()
             v = t.value
@@ -356,7 +462,8 @@ class Parser:
 
     def handle_at_date_literal(self, raw):
         try:
-            if raw.endswith("Z"):
+            # Accept both '2025-...Z' and timezone offsets
+            if isinstance(raw, str) and raw.endswith("Z"):
                 return datetime.fromisoformat(raw[:-1]).replace(tzinfo=timezone.utc)
             return datetime.fromisoformat(raw)
         except Exception:
@@ -365,7 +472,10 @@ class Parser:
     def handle_bang_tag(self, ident, param):
         if ident.lower() == "base64":
             try:
-                return base64.b64decode(param)
+                # param might include quotes if it was read as a raw token; ensure it's bytes input to b64decode
+                if isinstance(param, str):
+                    return base64.b64decode(param)
+                return base64.b64decode(str(param))
             except Exception as e:
                 raise DetaDashParseError(f"Invalid base64 data: {e}")
         return {"!"+ident: param}
